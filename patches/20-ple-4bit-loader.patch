@@ -1,0 +1,130 @@
+--- a/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
++++ b/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
+@@ -182,6 +182,72 @@
+ 
+     def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+         return F.embedding(input_, layer.weight)
++
++
++
++
++class Qwen4ExpPLENvFp4EmbeddingMethod(QuantizeMethodBase):
++    """BCN76_PLE_NVFP4: 4-bit E2M1 PLE embedding, per-16 FP8 block scales + one global scale."""
++
++    GROUP = 16
++
++    def create_weights(
++        self,
++        layer: nn.Module,
++        input_size_per_partition: int,
++        output_partition_sizes: list[int],
++        input_size: int,
++        output_size: int,
++        params_dtype: torch.dtype,
++        **extra_weight_attrs,
++    ) -> None:
++        del input_size, output_size
++        from vllm.model_executor.utils import set_weight_attrs
++        rows = sum(output_partition_sizes)
++        dim = input_size_per_partition
++        weight_loader = extra_weight_attrs.get("weight_loader")
++        wp = nn.Parameter(torch.empty(rows, dim // 2, dtype=torch.uint8),
++                          requires_grad=False)
++        set_weight_attrs(wp, {"input_dim": 1, "output_dim": 0,
++                              "weight_loader": weight_loader})
++        layer.register_parameter("weight_packed", wp)
++        ws = nn.Parameter(torch.empty(rows, dim // self.GROUP,
++                                      dtype=torch.float8_e4m3fn),
++                          requires_grad=False)
++        set_weight_attrs(ws, {"input_dim": 1, "output_dim": 0,
++                              "weight_loader": weight_loader})
++        layer.register_parameter("weight_scale", ws)
++        gs = nn.Parameter(torch.zeros((), dtype=torch.float32),
++                          requires_grad=False)
++        layer.register_parameter("weight_global_scale", gs)
++        layer._ple_nvfp4_dtype = params_dtype
++
++    def apply(self, layer, x, bias=None):
++        raise NotImplementedError("NVFP4 PLE weights only support embedding lookup")
++
++    _levels_cache: dict = {}
++
++    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
++        dev = layer.weight_packed.device
++        levels = self._levels_cache.get(dev)
++        if levels is None:
++            levels = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
++                                  device=dev)
++            self._levels_cache[dev] = levels
++        flat = input_.reshape(-1)
++        packed = layer.weight_packed.index_select(0, flat)
++        scales = layer.weight_scale.index_select(0, flat).to(torch.float32)
++        lo = packed & 0xF
++        hi = packed >> 4
++        codes = torch.stack((lo, hi), dim=-1).reshape(flat.shape[0], -1)
++        vals = levels[(codes & 7).long()]
++        vals = torch.where(codes & 8 > 0, -vals, vals)
++        dim = vals.shape[-1]
++        eff = scales * layer.weight_global_scale
++        vals = (vals.view(flat.shape[0], dim // self.GROUP, self.GROUP)
++                * eff.unsqueeze(-1)).view(flat.shape[0], dim)
++        out_dtype = getattr(layer, "_ple_nvfp4_dtype", torch.bfloat16) or torch.bfloat16
++        return vals.to(out_dtype).view(*input_.shape, dim)
+ 
+ 
+ def _get_ple_embedding_quant_method(
+@@ -190,6 +256,9 @@
+ ) -> QuantizeMethodBase | None:
+     """Select global-scale FP8 only for quantized PLE checkpoint shards."""
+ 
++    import os as _os  # BCN76_PLE_NVFP4
++    if _os.environ.get("VLLM_PLE_NVFP4") == "1":
++        return Qwen4ExpPLENvFp4EmbeddingMethod()
+     if not isinstance(quant_config, Fp8Config):
+         return None
+     if not quant_config.is_checkpoint_fp8_serialized:
+@@ -426,6 +495,8 @@
+             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
+             id_blocks.append(ids[request_indices, adjusted_columns])
+         ngram_ids = torch.cat(id_blocks, dim=-1)
++        if hasattr(self.ngram_embedding, "weight_packed"):  # BCN76_PLE_NVFP4
++            return self.ngram_embedding(ngram_ids).flatten(-2)
+         if output_buffer is not None:
+             output = output_buffer[:num_tokens, : self.embedding_dim]
+             torch.index_select(
+@@ -486,8 +557,35 @@
+                         f"{tuple(buffer.shape)}, got {tuple(loaded_weight.shape)}"
+                     )
+                 buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
++                loaded.add(name)
++                continue
++            if name == "ngram_embedding.weight_global_scale":  # BCN76_PLE_NVFP4
++                emb = self.ngram_embedding
++                emb.weight_global_scale.data.copy_(loaded_weight.reshape(()))
+                 loaded.add(name)
+                 continue
++            if name.startswith(shard_prefix) and (
++                name.endswith(".weight_packed")
++                or (name.endswith(".weight_scale") and "shard_" in name)
++            ):
++                sfx = ".weight_packed" if name.endswith(".weight_packed") else ".weight_scale"
++                shard_text = name[len(shard_prefix): -len(sfx)]
++                if shard_text.isdigit():
++                    shard_index = int(shard_text)
++                    emb = self.ngram_embedding
++                    if (emb.shard_indices.org_vocab_start_index != 0
++                            or emb.shard_indices.org_vocab_end_index < emb.org_vocab_size):
++                        raise NotImplementedError("NVFP4 PLE supports TP=1 only")
++                    pname = "weight_packed" if sfx == ".weight_packed" else "weight_scale"
++                    param = getattr(emb, pname)
++                    shard_size = (emb.org_vocab_size + self.split_ngram_parts - 1
++                                  ) // self.split_ngram_parts
++                    start = shard_index * shard_size
++                    rows = loaded_weight.shape[0]
++                    param.data[start:start + rows].copy_(
++                        loaded_weight.to(device=param.device))
++                    loaded.add("ngram_embedding." + pname)
++                    continue
+             if name.startswith(shard_prefix) and name.endswith(".weight"):
+                 shard_text = name[len(shard_prefix) : -len(".weight")]
+                 if not shard_text.isdigit():

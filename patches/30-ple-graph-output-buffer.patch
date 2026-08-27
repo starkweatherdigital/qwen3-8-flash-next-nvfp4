@@ -1,0 +1,20 @@
+--- a/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
++++ b/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
+@@ -496,7 +496,16 @@
+             id_blocks.append(ids[request_indices, adjusted_columns])
+         ngram_ids = torch.cat(id_blocks, dim=-1)
+         if hasattr(self.ngram_embedding, "weight_packed"):  # BCN76_PLE_NVFP4
+-            return self.ngram_embedding(ngram_ids).flatten(-2)
++            # BCN79_PLE_GRAPH: honor the caller's persistent output_buffer so
++            # this path is CUDA-graph-capture-safe (stable output address
++            # across replays). All dequant ops are static-shaped per capture;
++            # the levels cache is materialized on the uncaptured warmup call.
++            vals = self.ngram_embedding(ngram_ids).flatten(-2)
++            if output_buffer is not None:
++                output = output_buffer[:num_tokens, : self.embedding_dim]
++                output.copy_(vals)
++                return output
++            return vals
+         if output_buffer is not None:
+             output = output_buffer[:num_tokens, : self.embedding_dim]
+             torch.index_select(

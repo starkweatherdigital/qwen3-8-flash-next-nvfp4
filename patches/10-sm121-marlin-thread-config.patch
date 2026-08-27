@@ -1,0 +1,53 @@
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+@@ -98,6 +98,32 @@
+     M, K = hidden_states.size()
+     N = marlin_moe_intermediate_size(w1, w2)
+     w13_num_shards = 2 if activation.is_gated else 1
++
++    # ==== BCN-78 SM121 (DGX Spark GB10) Marlin thread-config workaround ====
++    # Ported from namake-taro/vllm-custom (Apache-2.0, v0.17.1+sparkcustom),
++    # whose sm121 patch set measured gpt-oss-120b TP=1 at ~64 tok/s on GB10.
++    # On SM121 Marlin's auto thread-config selects a 256-thread config
++    # ({128, 128, 256}) that (a) is subject to a shared-memory race producing
++    # corrupted logits (cf. vllm-project/vllm#37030: wrong first Harmony
++    # token on gpt-oss), and (b) for group_size=128 shapes has no valid
++    # config at SM121's shared-memory budget, falling back to a pessimal
++    # configuration. Force the safe 128-thread config {thread_k=64,
++    # thread_n=128} for large shapes. Gated strictly on SM 12.1 so no other
++    # device is affected. Rebase note: re-evaluate when upstream lands
++    # SM121 tuning in the Marlin selector (drop this block once
++    # is_valid_config handles SM121 natively).
++    _sm121_w1_thread_k = -1
++    _sm121_w1_thread_n = -1
++    _sm121_w2_thread_k = -1
++    _sm121_w2_thread_n = -1
++    if current_platform.is_device_capability(121):
++        if w13_num_shards * N >= 2048 or K >= 2048:
++            _sm121_w1_thread_k = 64
++            _sm121_w1_thread_n = 128
++        if N >= 2048:
++            _sm121_w2_thread_k = 64
++            _sm121_w2_thread_n = 128
++    # ==== end BCN-78 workaround ====
+     if workspace is None:
+         workspace = marlin_make_workspace_new(hidden_states.device, 4)
+ 
+@@ -159,6 +185,8 @@
+         use_atomic_add=False,
+         use_fp32_reduce=True,
+         is_zp_float=False,
++        thread_k=_sm121_w1_thread_k,
++        thread_n=_sm121_w1_thread_n,
+     )
+     activation_input = intermediate_cache1.view(-1, w13_num_shards * N)
+     if activation_func is None:
+@@ -226,6 +254,8 @@
+         use_atomic_add=False,
+         use_fp32_reduce=True,
+         is_zp_float=False,
++        thread_k=_sm121_w2_thread_k,
++        thread_n=_sm121_w2_thread_n,
+     )
+ 
+     return output
