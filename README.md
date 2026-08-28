@@ -5,9 +5,14 @@ that runs through vLLM on a single 121 GB GPU (built and tested on an NVIDIA DGX
 Spark, GB10/sm121).
 
 This repository contains the quantization recipe, the vLLM patches required to
-load the checkpoint, and the serving configuration. The weights themselves live
-on Hugging Face:
+load the checkpoint, the serving configuration, and the verification scripts.
+The weights themselves live on Hugging Face:
 [starkweatherdigital/qwen3.8-flash-next-nvfp4](https://huggingface.co/starkweatherdigital/qwen3.8-flash-next-nvfp4).
+
+**Start here: [docs/REPRODUCE.md](docs/REPRODUCE.md)** — the end-to-end guide,
+from the official 335 GB release to a served engine with speculative decoding,
+CUDA graphs, a 131K window and prefix caching all working, including the traps
+that cost us time.
 
 ## What was done
 
@@ -126,14 +131,26 @@ decode well below max clocks, so log `clocks.sm` alongside any benchmark.
 
 ## Contents
 
+- `docs/REPRODUCE.md` — **the end-to-end guide**: quantize, patch, serve,
+  verify, plus the optional FP8-periphery calibration and a list of every
+  trap that cost us time
+- `docs/PREFIX-CACHING.md` — why prefix caching crashes GDN hybrids, the two
+  fixes, and how to test cache changes so they can't lie to you
+- `quantize/` — the quantization pipeline: `quantlib.py` (NVFP4 packing math),
+  `quantdriver.py` (incremental, resumable BF16 → NVFP4 driver),
+  `apply_ple_nvfp4_patch.py` (generates the PLE loader patch)
 - `patches/` — six vLLM patches (apply with `patch -p1` in vLLM's
   site-packages, lexical order): sm121 Marlin thread config, the 4-bit PLE
   loader, a graph-safe PLE output buffer, PLE-from-NVMe mmap, and two
   prefix-caching fixes ported from unmerged upstream PRs (vllm#48375,
   vllm#53142)
-- `docs/PREFIX-CACHING.md` — why prefix caching crashes GDN hybrids, the two
-  fixes, and how to test cache changes so they can't lie to you
-- `Dockerfile` — reproduces the serving image
+- `serve/` — `serve.sh` (the serving command with every load-bearing flag
+  explained), `gates.py` (coherence → tools → speed-with-clocks acceptance),
+  `soak.py` (seeded varied-geometry soak with killer-replay), and
+  `test_ple_mmap_parity.py` (offline bit-identity proof for the mmap patch)
+- `calibrate/` — optional FP8-periphery path: activation-max calibration
+  server, its Dockerfile, and the `input_scale` graft
+- `Dockerfile` — reproduces the serving image (asserts all six patches applied)
 - `upload/` — Hugging Face upload tooling + weights model card
 - `LICENSE` — Qwen Community License 1.0 (inherited from the base model)
 
