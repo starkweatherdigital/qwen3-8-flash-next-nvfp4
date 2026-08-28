@@ -1,0 +1,589 @@
+--- /dev/null	2026-08-27 23:28:03
++++ b/vllm/models/qwen3_8_flash_next/nvidia/ple_nvfp4_mmap.py	2026-08-27 23:28:03
+@@ -0,0 +1,575 @@
++"""ple_nvfp4_mmap — serve the BCN-76 4-bit (NVFP4) Flash-Next PLE table from NVMe via mmap.
++
++BCN-82. Port of the blazux/qwen3.8-Flash-DGX mmap design (Apache-2.0) to the
++homelab NVFP4 checkpoint, whose PLE table is stored as per-shard tensor PAIRS
++(``shard_N.weight_packed`` uint8 [rows, head_dim//2] + ``shard_N.weight_scale``
++fp8e4m3 [rows, head_dim//16]) plus one scalar ``weight_global_scale`` (F32),
++rather than the official checkpoint's single FP8 array per shard.
++
++Why: the table is 320,001,536 rows x 90 B = 26.8 GiB resident on a 121 GiB
++unified-memory GB10. A token only touches 16 rows (~1.4 KB packed+scales), so
++the table can live on NVMe and be served through the page cache.
++
++How (mirrors the blazux install): with VLLM_PLE_NVFP4_MMAP=1,
++``apply(Qwen3_8FlashNextNGramEmbedding)`` — appended to the end of
++``ple_layer.py`` in the image — patches the class:
++  * ``__init__`` swaps the 26.8 GiB ``VocabParallelEmbedding`` for a small
++    placeholder whose ``forward(ids)`` gathers packed rows + block scales from
++    ``np.memmap`` views of the checkpoint shards and dequantizes them on the
++    input device with EXACTLY the Qwen4ExpPLENvFp4EmbeddingMethod math
++    (same bytes in, bit-identical bf16 out);
++  * ``load_weights`` drops the 256 shard tensors on the floor, keeps
++    ``weight_global_scale`` on the placeholder, and opens the memmaps;
++  * ``forward_impl`` (hashing + lookup) is wrapped in the custom op
++    ``vllm::ple_nvfp4_mmap_lookup`` so torch.compile treats it as opaque and
++    it can be listed in splitting_ops to run OUTSIDE piecewise CUDA graphs
++    (the gather is CPU work + a pageable H2D copy — uncapturable).
++
++Knobs (env):
++  VLLM_PLE_NVFP4_MMAP=1            enable
++  VLLM_PLE_NVFP4_MMAP_WORKERS=32   gather threads
++  VLLM_PLE_NVFP4_MMAP_CHUNK=2048   rows per gather task
++  VLLM_PLE_NVFP4_MMAP_PREWARM=0    1 = stream both tables once at load
++
++This module keeps all vllm imports lazy so the offline unit test
++(test_ple_nvfp4_mmap.py) can exercise the table + placeholder on a plain
++torch+numpy machine against the real checkpoint files.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import math
++import os
++import re
++import struct
++import sys
++from concurrent.futures import ThreadPoolExecutor
++from typing import Iterable
++
++import numpy as np
++import torch
++import torch.nn as nn
++
++logger = logging.getLogger("vllm.ple_nvfp4_mmap")
++
++ENV_ENABLE = "VLLM_PLE_NVFP4_MMAP"
++
++# E2M1 magnitude table — MUST match Qwen4ExpPLENvFp4EmbeddingMethod exactly.
++_E2M1_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
++_NVFP4_GROUP = 16  # elements per fp8 block scale
++
++
++def enabled() -> bool:
++    return os.environ.get(ENV_ENABLE, "0").lower() in ("1", "true", "yes")
++
++
++def _env_int(name: str, default: int) -> int:
++    try:
++        return int(os.environ.get(name, default))
++    except ValueError:
++        return default
++
++
++# --------------------------------------------------------------------------- #
++# safetensors header parsing (raw offsets; the safetensors package hides them)
++# --------------------------------------------------------------------------- #
++def parse_safetensors_header(path: str) -> tuple[dict, int]:
++    with open(path, "rb") as f:
++        (header_len,) = struct.unpack("<Q", f.read(8))
++        header = json.loads(f.read(header_len))
++    header.pop("__metadata__", None)
++    return header, 8 + header_len
++
++
++class MmapNvFp4PleTable:
++    """Row gather over packed + scale shard tensors mmapped from disk.
++
++    ``shards``: {shard_index: (packed_path, packed_off, scale_path, scale_off,
++    rows)}. Shard ``i`` holds global rows [i*shard_size, i*shard_size + rows)
++    — the layout load_weights writes with ``param.data[start:start+rows]``.
++    """
++
++    def __init__(
++        self,
++        shards: dict[int, tuple[str, int, str, int, int]],
++        shard_size: int,
++        packed_bytes: int,
++        scale_bytes: int,
++        workers: int = 32,
++        chunk: int = 2048,
++    ) -> None:
++        if not shards:
++            raise ValueError("no PLE shards")
++        self.shard_size = int(shard_size)
++        self.packed_bytes = int(packed_bytes)
++        self.scale_bytes = int(scale_bytes)
++        self.chunk = max(1, int(chunk))
++        n = max(shards) + 1
++        self.mm_packed: list[np.memmap | None] = [None] * n
++        self.mm_scale: list[np.memmap | None] = [None] * n
++        self.rows_total = 0
++        for idx, (p_path, p_off, s_path, s_off, rows) in shards.items():
++            self.mm_packed[idx] = np.memmap(
++                p_path, dtype=np.uint8, mode="r", offset=p_off,
++                shape=(rows, packed_bytes),
++            )
++            self.mm_scale[idx] = np.memmap(
++                s_path, dtype=np.uint8, mode="r", offset=s_off,
++                shape=(rows, scale_bytes),
++            )
++            self.rows_total += rows
++        self.pool = ThreadPoolExecutor(max_workers=max(1, int(workers)))
++
++    def gather(self, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
++        """ids: int64 [N] global rows -> (uint8 [N, packed_bytes], uint8 [N, scale_bytes])."""
++        ids = np.ascontiguousarray(ids, dtype=np.int64).reshape(-1)
++        if ids.size == 0:
++            return (
++                np.empty((0, self.packed_bytes), dtype=np.uint8),
++                np.empty((0, self.scale_bytes), dtype=np.uint8),
++            )
++        # Dedupe + sort: repeated n-grams are common; sorted rows improve
++        # locality within a shard.
++        uniq, inverse = np.unique(ids, return_inverse=True)
++        if uniq[0] < 0 or uniq[-1] >= self.shard_size * len(self.mm_packed):
++            raise IndexError(
++                f"PLE row id out of range: [{uniq[0]}, {uniq[-1]}] "
++                f"for {self.rows_total} rows"
++            )
++        shard = uniq // self.shard_size
++        local = uniq - shard * self.shard_size
++        out_p = np.empty((uniq.size, self.packed_bytes), dtype=np.uint8)
++        out_s = np.empty((uniq.size, self.scale_bytes), dtype=np.uint8)
++
++        bounds = np.flatnonzero(np.diff(shard)) + 1
++        starts = np.concatenate(([0], bounds))
++        ends = np.concatenate((bounds, [uniq.size]))
++        tasks: list[tuple[int, int, int]] = []
++        for s, e in zip(starts.tolist(), ends.tolist()):
++            si = int(shard[s])
++            for c in range(s, e, self.chunk):
++                tasks.append((si, c, min(c + self.chunk, e)))
++
++        def run(task: tuple[int, int, int]) -> None:
++            si, a, b = task
++            mm_p = self.mm_packed[si]
++            mm_s = self.mm_scale[si]
++            if mm_p is None or mm_s is None:
++                raise IndexError(f"PLE shard {si} missing")
++            rows = local[a:b]
++            # Fancy indexing on a memmap: page faults do the I/O; NumPy
++            # releases the GIL for the copy, so tasks overlap across threads.
++            out_p[a:b] = mm_p[rows]
++            out_s[a:b] = mm_s[rows]
++
++        if len(tasks) == 1:
++            run(tasks[0])
++        else:
++            for _ in self.pool.map(run, tasks):
++                pass
++        return out_p[inverse], out_s[inverse]
++
++    def prewarm(self) -> None:
++        block = 64 << 20
++        for mm in (*self.mm_packed, *self.mm_scale):
++            if mm is None:
++                continue
++            path = mm.filename
++            start = mm.offset
++            end = start + mm.shape[0] * mm.shape[1]
++            with open(path, "rb", buffering=0) as f:
++                f.seek(start)
++                pos = start
++                while pos < end:
++                    n = f.readinto(bytearray(min(block, end - pos)))
++                    if not n:
++                        break
++                    pos += n
++
++
++# --------------------------------------------------------------------------- #
++# Placeholder standing in for VocabParallelEmbedding (NVFP4 quant method)
++# --------------------------------------------------------------------------- #
++class _MmapNvFp4NgramEmbedding(nn.Module):
++    """Duck-types what the PLE code reads off the NVFP4 VocabParallelEmbedding.
++
++    Deliberately exposes NO ``weight``, ``weight_packed`` or ``weight_scale``
++    attribute: ``forward_impl``'s resident-path branches and
++    ``Qwen3_8FlashNextPLELayer._get_embedding_weight_scale`` must not fire.
++    Output is dequantized bf16 — same contract as the resident NVFP4 method.
++    """
++
++    _levels_cache: dict = {}
++
++    def __init__(
++        self,
++        num_embeddings: int,
++        embedding_dim: int,
++        params_dtype: torch.dtype | None = None,
++    ) -> None:
++        super().__init__()
++        self.num_embeddings = int(num_embeddings)
++        self.org_vocab_size = int(num_embeddings)
++        self.embedding_dim = int(embedding_dim)
++        self.table: MmapNvFp4PleTable | None = None
++        self._out_dtype = params_dtype or torch.bfloat16
++        # Filled by load_weights / _setup_table; f32 scalar like the original
++        # weight_global_scale parameter.
++        self.register_buffer(
++            "weight_global_scale",
++            torch.zeros((), dtype=torch.float32),
++            persistent=False,
++        )
++
++    def forward(self, ids: torch.Tensor) -> torch.Tensor:
++        table = self.table
++        if table is None:
++            # Weights never loaded (e.g. --load-format dummy): keep the
++            # plumbing alive with zeros.
++            return torch.zeros(
++                (*ids.shape, self.embedding_dim),
++                dtype=self._out_dtype,
++                device=ids.device,
++            )
++        flat = ids.reshape(-1)
++        if flat.shape[0] == 0:
++            return torch.zeros(
++                (*ids.shape, self.embedding_dim),
++                dtype=self._out_dtype,
++                device=ids.device,
++            )
++        ids_np = flat.detach().to("cpu", non_blocking=False).numpy()
++        packed_np, scales_np = table.gather(ids_np)
++        dev = ids.device
++        packed = torch.from_numpy(packed_np).to(dev, non_blocking=True)
++        scales = (
++            torch.from_numpy(scales_np)
++            .view(torch.float8_e4m3fn)
++            .to(dev, non_blocking=True)
++            .to(torch.float32)
++        )
++        # ---- dequant: byte-for-byte the Qwen4ExpPLENvFp4EmbeddingMethod math
++        levels = self._levels_cache.get(dev)
++        if levels is None:
++            levels = torch.tensor(list(_E2M1_LEVELS), device=dev)
++            self._levels_cache[dev] = levels
++        lo = packed & 0xF
++        hi = packed >> 4
++        codes = torch.stack((lo, hi), dim=-1).reshape(flat.shape[0], -1)
++        vals = levels[(codes & 7).long()]
++        vals = torch.where(codes & 8 > 0, -vals, vals)
++        dim = vals.shape[-1]
++        eff = scales * self.weight_global_scale
++        vals = (
++            vals.view(flat.shape[0], dim // _NVFP4_GROUP, _NVFP4_GROUP)
++            * eff.unsqueeze(-1)
++        ).view(flat.shape[0], dim)
++        return vals.to(self._out_dtype).view(*ids.shape, dim)
++
++
++# --------------------------------------------------------------------------- #
++# Shard discovery against the homelab NVFP4 checkpoint layout
++# --------------------------------------------------------------------------- #
++def find_nvfp4_shards(
++    model_path: str, layer_idx: int
++) -> tuple[
++    dict[int, tuple[str, int, str, int, int]],
++    int,
++    int,
++    tuple[str, int] | None,
++]:
++    """Locate shard_N.weight_packed / shard_N.weight_scale pairs + global scale.
++
++    Returns (shards, packed_bytes, scale_bytes, global_scale_entry) where
++    global_scale_entry is (path, abs_offset) of the F32 scalar or None.
++    """
++    packed_re = re.compile(
++        rf"layers\.{layer_idx}\.ple\.ple_embedding\.ngram_embedding\.shard_(\d+)\.weight_packed$"
++    )
++    scale_re = re.compile(
++        rf"layers\.{layer_idx}\.ple\.ple_embedding\.ngram_embedding\.shard_(\d+)\.weight_scale$"
++    )
++    gscale_re = re.compile(
++        rf"layers\.{layer_idx}\.ple\.ple_embedding\.ngram_embedding\.weight_global_scale$"
++    )
++    index_path = os.path.join(model_path, "model.safetensors.index.json")
++    if os.path.exists(index_path):
++        with open(index_path) as f:
++            weight_map = json.load(f)["weight_map"]
++        files = sorted(
++            {
++                os.path.join(model_path, fn)
++                for name, fn in weight_map.items()
++                if packed_re.search(name)
++                or scale_re.search(name)
++                or gscale_re.search(name)
++            }
++        )
++    else:
++        import glob as _glob
++
++        files = sorted(_glob.glob(os.path.join(model_path, "*.safetensors")))
++
++    packed: dict[int, tuple[str, int, int]] = {}
++    scale: dict[int, tuple[str, int, int]] = {}
++    packed_bytes: int | None = None
++    scale_bytes: int | None = None
++    gscale: tuple[str, int] | None = None
++    for path in files:
++        header, data_start = parse_safetensors_header(path)
++        for name, meta in header.items():
++            pm = packed_re.search(name)
++            sm = scale_re.search(name)
++            gm = gscale_re.search(name)
++            if pm:
++                if meta["dtype"] != "U8":
++                    raise ValueError(f"{name}: expected U8, got {meta['dtype']}")
++                start, end = meta["data_offsets"]
++                rows, cols = meta["shape"]
++                if end - start != rows * cols:
++                    raise ValueError(f"{name}: size/shape mismatch")
++                if packed_bytes is None:
++                    packed_bytes = cols
++                elif cols != packed_bytes:
++                    raise ValueError(f"{name}: mixed packed widths")
++                packed[int(pm.group(1))] = (path, data_start + start, rows)
++            elif sm:
++                if meta["dtype"] != "F8_E4M3":
++                    raise ValueError(f"{name}: expected F8_E4M3, got {meta['dtype']}")
++                start, end = meta["data_offsets"]
++                rows, cols = meta["shape"]
++                if end - start != rows * cols:
++                    raise ValueError(f"{name}: size/shape mismatch")
++                if scale_bytes is None:
++                    scale_bytes = cols
++                elif cols != scale_bytes:
++                    raise ValueError(f"{name}: mixed scale widths")
++                scale[int(sm.group(1))] = (path, data_start + start, rows)
++            elif gm:
++                if meta["dtype"] != "F32" or meta["shape"] != []:
++                    raise ValueError(
++                        f"{name}: expected scalar F32, got "
++                        f"{meta['dtype']} {meta['shape']}"
++                    )
++                start, _end = meta["data_offsets"]
++                gscale = (path, data_start + start)
++
++    if set(packed) != set(scale):
++        raise ValueError(
++            "PLE packed/scale shard sets differ: "
++            f"{sorted(set(packed) ^ set(scale))}"
++        )
++    shards: dict[int, tuple[str, int, str, int, int]] = {}
++    for idx, (p_path, p_off, p_rows) in packed.items():
++        s_path, s_off, s_rows = scale[idx]
++        if p_rows != s_rows:
++            raise ValueError(f"PLE shard {idx}: packed rows {p_rows} != scale rows {s_rows}")
++        shards[idx] = (p_path, p_off, s_path, s_off, p_rows)
++    assert packed_bytes is not None and scale_bytes is not None
++    return shards, packed_bytes, scale_bytes, gscale
++
++
++def read_global_scale(entry: tuple[str, int]) -> torch.Tensor:
++    path, offset = entry
++    with open(path, "rb") as f:
++        f.seek(offset)
++        raw = f.read(4)
++    return torch.tensor(struct.unpack("<f", raw)[0], dtype=torch.float32)
++
++
++# --------------------------------------------------------------------------- #
++# Patch (in-image only; everything above is offline-testable)
++# --------------------------------------------------------------------------- #
++_REGISTRY: dict[str, nn.Module] = {}
++_OP_NAME = "ple_nvfp4_mmap_lookup"
++
++
++def _lookup_impl(
++    input_ids: torch.Tensor,
++    query_start_loc: torch.Tensor,
++    ngram_context: torch.Tensor,
++    output: torch.Tensor,
++    layer_name: str,
++) -> None:
++    layer = _REGISTRY[layer_name]
++    result = layer._ple_mmap_orig_forward_impl(
++        None, input_ids, query_start_loc, ngram_context
++    )
++    output[: result.shape[0]].copy_(result.to(output.dtype))
++
++
++def _lookup_fake(
++    input_ids: torch.Tensor,
++    query_start_loc: torch.Tensor,
++    ngram_context: torch.Tensor,
++    output: torch.Tensor,
++    layer_name: str,
++) -> None:
++    return
++
++
++def _register_op() -> None:
++    if hasattr(torch.ops.vllm, _OP_NAME):
++        return
++    from vllm.utils.torch_utils import direct_register_custom_op
++
++    direct_register_custom_op(
++        op_name=_OP_NAME,
++        op_func=_lookup_impl,
++        mutates_args=["output"],
++        fake_impl=_lookup_fake,
++    )
++
++
++def apply(cls: type) -> None:
++    """Patch Qwen3_8FlashNextNGramEmbedding (pass the class) when enabled."""
++    if not enabled():
++        return
++    if getattr(cls, "_ple_mmap_patched", False):
++        return
++    mod = sys.modules[cls.__module__]
++    orig_init = cls.__init__
++    orig_load_weights = cls.load_weights
++
++    def __init__(self, config, embedding_dim, ple_dense_layer_id, max_total_tokens,
++                 max_num_reqs, prefix, quant_config=None, params_dtype=None):
++        # Run the stock constructor (hash buffers, workspaces, multipliers)
++        # with the embedding class swapped for the placeholder so the 26.8 GiB
++        # packed/scale params are never allocated. The lambda swallows the
++        # padding_size/prefix/quant_method kwargs the stock call passes.
++        real_embedding_cls = mod.VocabParallelEmbedding
++        mod.VocabParallelEmbedding = (
++            lambda n, d, **_kw: _MmapNvFp4NgramEmbedding(n, d, params_dtype)
++        )
++        try:
++            orig_init(self, config, embedding_dim, ple_dense_layer_id,
++                      max_total_tokens, max_num_reqs, prefix,
++                      quant_config=quant_config, params_dtype=params_dtype)
++        finally:
++            mod.VocabParallelEmbedding = real_embedding_cls
++        self._ple_mmap_prefix = prefix
++        _REGISTRY[prefix] = self
++        self._ple_mmap_model_path = None
++        try:
++            from vllm.config import get_current_vllm_config
++
++            self._ple_mmap_model_path = get_current_vllm_config().model_config.model
++        except Exception as exc:  # pragma: no cover - defensive
++            logger.warning("PLE mmap: cannot read model path from vllm config: %s", exc)
++        logger.info(
++            "PLE nvfp4 mmap: %s -> placeholder embedding (%d rows x %d), table on NVMe",
++            prefix, self.ngram_embedding.org_vocab_size, self.head_dim,
++        )
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        loaded: set[str] = set()
++        rest: list[tuple[str, torch.Tensor]] = []
++        for name, w in weights:
++            if (
++                name.startswith("ngram_embedding.shard_")
++                and (name.endswith(".weight_packed") or name.endswith(".weight_scale"))
++            ):
++                loaded.add(name)  # served from disk, never materialised
++                continue
++            if name == "ngram_embedding.weight_global_scale":
++                self.ngram_embedding.weight_global_scale.copy_(w.reshape(()))
++                self.ngram_embedding._gscale_loaded = True
++                loaded.add(name)
++                continue
++            rest.append((name, w))
++        loaded.update(orig_load_weights(self, rest))
++        _setup_table(self)
++        return loaded
++
++    def _setup_table(self) -> None:
++        emb = self.ngram_embedding
++        if emb.table is not None:
++            return
++        model_path = self._ple_mmap_model_path
++        if not model_path or not os.path.isdir(model_path):
++            raise RuntimeError(
++                f"PLE mmap: model path {model_path!r} is not a local directory; "
++                "point the model at the downloaded snapshot"
++            )
++        m = re.search(r"layers\.(\d+)\.", self._ple_mmap_prefix)
++        if not m:
++            raise RuntimeError(
++                f"PLE mmap: cannot find layer index in {self._ple_mmap_prefix!r}"
++            )
++        layer_idx = int(m.group(1))
++        shards, packed_bytes, scale_bytes, gscale = find_nvfp4_shards(
++            model_path, layer_idx
++        )
++        if not shards:
++            raise RuntimeError(
++                f"PLE mmap: no NVFP4 shard tensors for layer {layer_idx} under {model_path}"
++            )
++        if packed_bytes != self.head_dim // 2:
++            raise RuntimeError(
++                f"PLE mmap: packed width {packed_bytes} != head_dim//2 {self.head_dim // 2}"
++            )
++        if scale_bytes != self.head_dim // _NVFP4_GROUP:
++            raise RuntimeError(
++                f"PLE mmap: scale width {scale_bytes} != head_dim//16 "
++                f"{self.head_dim // _NVFP4_GROUP}"
++            )
++        if not getattr(emb, "_gscale_loaded", False):
++            if gscale is None:
++                raise RuntimeError("PLE mmap: weight_global_scale not found")
++            emb.weight_global_scale.copy_(read_global_scale(gscale))
++        parts = int(self.split_ngram_parts)
++        vocab = int(emb.org_vocab_size)
++        shard_size = math.ceil(vocab / parts)
++        for idx, (_pp, _po, _sp, _so, rows) in shards.items():
++            expected = max(0, min(shard_size, vocab - idx * shard_size))
++            if rows != expected:
++                raise RuntimeError(
++                    f"PLE mmap: shard {idx} has {rows} rows, expected {expected}"
++                )
++        table = MmapNvFp4PleTable(
++            shards, shard_size, packed_bytes, scale_bytes,
++            workers=_env_int("VLLM_PLE_NVFP4_MMAP_WORKERS", 32),
++            chunk=_env_int("VLLM_PLE_NVFP4_MMAP_CHUNK", 2048),
++        )
++        if _env_int("VLLM_PLE_NVFP4_MMAP_PREWARM", 0):
++            logger.info(
++                "PLE mmap: prewarming page cache (%.1f GiB)...",
++                table.rows_total * (packed_bytes + scale_bytes) / 2**30,
++            )
++            table.prewarm()
++        emb.weight_global_scale.data = emb.weight_global_scale.to(
++            torch.accelerator.current_accelerator()
++        )
++        emb.table = table
++        logger.info(
++            "PLE nvfp4 mmap: layer %d, %d shards, %d rows x (%d+%d) B "
++            "(%.1f GiB on disk), %d workers",
++            layer_idx, len(shards), table.rows_total, packed_bytes, scale_bytes,
++            table.rows_total * (packed_bytes + scale_bytes) / 2**30,
++            table.pool._max_workers,
++        )
++
++    def forward_impl(self, hidden_states, input_ids, query_start_loc, ngram_context,
++                     output_buffer=None):
++        del hidden_states, output_buffer
++        num_tokens = input_ids.reshape(-1).shape[0]
++        output = torch.empty(
++            (num_tokens, self.embedding_dim),
++            dtype=self.ngram_embedding._out_dtype,
++            device=input_ids.device,
++        )
++        getattr(torch.ops.vllm, _OP_NAME)(
++            input_ids, query_start_loc, ngram_context, output, self._ple_mmap_prefix
++        )
++        return output
++
++    _register_op()
++    cls._ple_mmap_orig_forward_impl = cls.forward_impl
++    cls.forward_impl = forward_impl
++    cls.__init__ = __init__
++    cls.load_weights = load_weights
++    cls._setup_table = _setup_table
++    cls._ple_mmap_patched = True
++    logger.info("PLE nvfp4 mmap patch applied to %s.%s", cls.__module__, cls.__name__)
+--- a/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py	2026-08-27 23:28:03
++++ b/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py	2026-08-27 23:28:03
+@@ -1349,3 +1349,8 @@
+     "Qwen3_8FlashNextPLEGroupedNorm",
+     "Qwen3_8FlashNextPLELayer",
+ ]
++
++
++# BCN82_PLE_NVFP4_MMAP: optional NVMe-mmap serving of the 4-bit PLE table
++from .ple_nvfp4_mmap import apply as _ple_nvfp4_mmap_apply
++_ple_nvfp4_mmap_apply(Qwen3_8FlashNextNGramEmbedding)
